@@ -33,13 +33,7 @@ namespace Microsoft.Azure.Cosmos
             this.HasMoreResults = true;
             this.changeFeedOptions = options;
             this.originalMaxItemCount = options.MaxItemCount;
-            this.compositeContinuationToken = new StandByFeedContinuationToken(options.RequestContinuation);
         }
-
-        /// <summary>
-        /// The Continuation Token
-        /// </summary>
-        protected string continuationToken => this.compositeContinuationToken?.NextToken;
 
         /// <summary>
         /// The query options for the result set
@@ -53,54 +47,44 @@ namespace Microsoft.Azure.Cosmos
         /// <returns>A query response from cosmos service</returns>
         public override async Task<CosmosResponseMessage> FetchNextSetAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
-            PartitionKeyRangeCache pkRangeCache = await this.cosmosContainer.Client.DocumentClient.GetPartitionKeyRangeCacheAsync();
-            if (this.containerRid == null)
+            if (this.compositeContinuationToken == null)
             {
+                PartitionKeyRangeCache pkRangeCache = await this.cosmosContainer.Client.DocumentClient.GetPartitionKeyRangeCacheAsync();
                 this.containerRid = await this.cosmosContainer.GetRID(cancellationToken);
+                this.compositeContinuationToken = new StandByFeedContinuationToken(this.containerRid, this.changeFeedOptions.RequestContinuation, pkRangeCache);
             }
 
-            await this.compositeContinuationToken.InitializeCompositeTokens(this.containerRid, pkRangeCache);
-            this.changeFeedOptions.PartitionKeyRangeId = await this.compositeContinuationToken.GetPartitionKeyRangeIdForCurrentState(this.containerRid, pkRangeCache);
-            this.changeFeedOptions.RequestContinuation = this.continuationToken;
+            (CompositeContinuationToken currentRangeToken, string rangeId) = await this.compositeContinuationToken.GetCurrentToken();
+
+            this.changeFeedOptions.PartitionKeyRangeId = rangeId;
+            this.changeFeedOptions.RequestContinuation = currentRangeToken.Token;
 
             CosmosResponseMessage response = await this.NextResultSetDelegate(this.changeFeedOptions, cancellationToken);
-            if (await this.ShouldRetryFailure(pkRangeCache, response, cancellationToken))
+            if (await this.ShouldRetryFailure(response, cancellationToken))
             {
-                this.HasMoreResults = true;
-                CosmosResponseMessage retryMessage = new CosmosResponseMessage(HttpStatusCode.NoContent);
-                retryMessage.Headers.Continuation = this.compositeContinuationToken.NextToken;
-                return retryMessage;
+                response = await this.NextResultSetDelegate(this.changeFeedOptions, cancellationToken);
             }
 
             // Change Feed read uses Etag for continuation
             string responseContinuationToken = response.Headers.ETag;
-            this.HasMoreResults = GetHasMoreResults(responseContinuationToken, response.StatusCode);
-            if (!this.HasMoreResults)
+            if (response.IsSuccessStatusCode)
             {
-                // Current Range is done, push it to the end
-                response.Headers.Continuation = this.compositeContinuationToken.PushCurrentToBack();
-                this.HasMoreResults = true;
-            }
-            else
-            {
-                response.Headers.Continuation = this.compositeContinuationToken.UpdateCurrentToken(responseContinuationToken);
+                currentRangeToken.Token = responseContinuationToken;
             }
 
+            if (response.StatusCode == HttpStatusCode.NotModified)
+            {
+                this.compositeContinuationToken.MoveToNextToken();
+            }
+
+            response.Headers.Continuation = this.compositeContinuationToken.ToString();
             return response;
-        }
-
-        internal static bool GetHasMoreResults(
-            string continuationToken, 
-            HttpStatusCode statusCode)
-        {
-            return continuationToken != null && statusCode != HttpStatusCode.NotModified;
         }
 
         /// <summary>
         /// During Feed read, split can happen or Max Item count can go beyond the max response size
         /// </summary>
         internal async Task<bool> ShouldRetryFailure(
-            PartitionKeyRangeCache pkRangeCache, 
             CosmosResponseMessage response, 
             CancellationToken cancellationToken = default(CancellationToken))
         {
@@ -118,6 +102,7 @@ namespace Microsoft.Azure.Cosmos
                 && response.Headers.SubStatusCode != Documents.SubStatusCodes.ReadSessionNotAvailable;
             if (partitionNotFound)
             {
+                // TODO: Is this for collection re-create ???
                 this.containerRid = await this.cosmosContainer.GetRID(cancellationToken);
                 await this.compositeContinuationToken.InitializeCompositeTokens(this.containerRid, pkRangeCache, true);
                 return true;
@@ -127,7 +112,8 @@ namespace Microsoft.Azure.Cosmos
                 && (response.Headers.SubStatusCode == Documents.SubStatusCodes.PartitionKeyRangeGone || response.Headers.SubStatusCode == Documents.SubStatusCodes.CompletingSplit);
             if (partitionSplit)
             {
-                return await this.compositeContinuationToken.HandleRequestSplit(this.containerRid, pkRangeCache);
+                await this.compositeContinuationToken.GetCurrentToken(forceRefresh: true);
+                return true;
             }
 
             bool pageSizeError = response.ErrorMessage.Contains("Reduce page size and try again.");
