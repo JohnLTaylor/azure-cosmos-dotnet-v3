@@ -62,6 +62,11 @@ namespace Microsoft.Azure.Cosmos
             CosmosResponseMessage response = await this.NextResultSetDelegate(this.changeFeedOptions, cancellationToken);
             if (await this.ShouldRetryFailure(response, cancellationToken))
             {
+                // Cahe refresh already done by ShouldRetryFailure()
+                (currentRangeToken, rangeId) = await this.compositeContinuationToken.GetCurrentToken();
+
+                this.changeFeedOptions.PartitionKeyRangeId = rangeId;
+                this.changeFeedOptions.RequestContinuation = currentRangeToken.Token;
                 response = await this.NextResultSetDelegate(this.changeFeedOptions, cancellationToken);
             }
 
@@ -96,16 +101,6 @@ namespace Microsoft.Azure.Cosmos
                 }
 
                 return false;
-            }
-
-            bool partitionNotFound = response.StatusCode == HttpStatusCode.NotFound 
-                && response.Headers.SubStatusCode != Documents.SubStatusCodes.ReadSessionNotAvailable;
-            if (partitionNotFound)
-            {
-                // TODO: Is this for collection re-create ???
-                this.containerRid = await this.cosmosContainer.GetRID(cancellationToken);
-                await this.compositeContinuationToken.InitializeCompositeTokens(this.containerRid, pkRangeCache, true);
-                return true;
             }
 
             bool partitionSplit = response.StatusCode == HttpStatusCode.Gone 

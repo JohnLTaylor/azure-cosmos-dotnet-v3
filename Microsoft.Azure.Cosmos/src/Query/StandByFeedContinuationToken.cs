@@ -45,7 +45,7 @@ namespace Microsoft.Azure.Cosmos.Query
             if (resolvedRanges.Count > 1) 
             {
                 // Split happened already replace first with the split ranges
-                // Don't push it back as it required next partiton visit which also might ahve been split
+                // Don't push it back as it required next partiton visit which also might have been split
                 this.compositeContinuationTokens.RemoveFirst();
                 foreach(Documents.PartitionKeyRange newRange in resolvedRanges)
                 {
@@ -60,7 +60,7 @@ namespace Microsoft.Azure.Cosmos.Query
                     });
                 }
 
-                // Reset firs token 
+                // Reset first token 
                 firstToken = this.compositeContinuationTokens.First();
             }
 
